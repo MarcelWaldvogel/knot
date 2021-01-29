@@ -57,6 +57,8 @@ enum {
 
 volatile int xdp_trigger = KXDPGUN_WAIT_START;
 
+volatile unsigned stats_trigger = 0;
+
 unsigned global_cpu_aff_start = 0;
 unsigned global_cpu_aff_step = 1;
 
@@ -113,6 +115,14 @@ static void sigterm_handler(int signo)
 {
 	assert(signo == SIGTERM || signo == SIGINT);
 	xdp_trigger = KXDPGUN_STOP;
+}
+
+static void sigusr_handler(int signo)
+{
+	assert(signo == SIGUSR1);
+	if (global_stats.collected == 0) {
+		stats_trigger++;
+	}
 }
 
 static void clear_stats(kxdpgun_stats_t *st)
@@ -180,6 +190,8 @@ static void print_stats(kxdpgun_stats_t *st, bool tcp, bool recv)
 			}
 		}
 	}
+
+	pthread_mutex_unlock(&st->mutex);
 }
 
 inline static void timer_start(struct timespec *timesp)
@@ -302,6 +314,7 @@ void *xdp_gun_thread(void *_ctx)
 	knot_xdp_msg_t pkts[ctx->at_once];
 	uint64_t errors = 0, duration = 0;
 	kxdpgun_stats_t local_stats = { 0 };
+	unsigned stats_triggered = 0;
 
 	knot_mm_t mm;
 	if (ctx->tcp) {
@@ -445,11 +458,23 @@ void *xdp_gun_thread(void *_ctx)
 			}
 		}
 
-		// speed part
+		// speed and signal part
 		uint64_t dura_exp = (local_stats.qry_sent * 1000000) / ctx->qps;
 		duration = timer_end(&timer);
 		if (xdp_trigger == KXDPGUN_STOP && ctx->duration > duration) {
 			ctx->duration = duration;
+		}
+		if (stats_trigger > stats_triggered) {
+			assert(stats_trigger == stats_triggered + 1);
+			stats_triggered++;
+
+			local_stats.duration = duration;
+			size_t collected = collect_stats(&global_stats, &local_stats);
+			assert(collected <= ctx->n_threads);
+			if (collected == ctx->n_threads) {
+				print_stats(&global_stats, ctx->tcp, !(ctx->listen_port & KNOT_XDP_LISTEN_PORT_DROP));
+				clear_stats(&global_stats);
+			}
 		}
 		if (dura_exp > duration) {
 			usleep(dura_exp - duration);
@@ -889,8 +914,11 @@ int main(int argc, char *argv[])
 	if (sig_ret != SIG_ERR) {
 		sig_ret = signal(SIGINT, sigterm_handler);
 	}
+	if (sig_ret != SIG_ERR) {
+		sig_ret = signal(SIGUSR1, sigusr_handler);
+	}
 	if (sig_ret == SIG_ERR) {
-		printf("warning: unable to handle SIGTERM and SIGINT: %s\n", strerror(errno));
+		printf("warning: unable to handle SIGTERM, SIGINT and SIGUSR1: %s\n", strerror(errno));
 	}
 
 	for (size_t i = 0; i < ctx.n_threads; i++) {
